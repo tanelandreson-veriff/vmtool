@@ -2334,7 +2334,7 @@ class VmTool(EnvScript):
         prefix = self.cf.get('cloudwatch_alarm_prefix', 'vm-status-')
         topic = self.cf.get('cloudwatch_alarm_topic', '')
         client = self.get_cloudwatch()
-        for check in checks:
+        for done, check in enumerate(checks):
             metric, evals = self.CW_ALARM_SPECS[check]
             desc = self.cf.get('cloudwatch_alarm_desc_%s' % check,
                                '%s status check failed' % check)
@@ -2354,7 +2354,8 @@ class VmTool(EnvScript):
                     AlarmActions=actions,
                     OKActions=actions)
             except Exception as ex:
-                eprintf("WARNING: alarm create failed (%s/%s): %s", vm_id, check, ex)
+                eprintf("WARNING: alarm create failed (%s/%s), %d/%d alarms set, fix with alarm-sync: %s",
+                        vm_id, check, done, len(checks), ex)
                 return
         time_printf("Status alarms set: %s", vm_id)
 
