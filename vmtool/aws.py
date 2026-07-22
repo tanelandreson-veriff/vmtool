@@ -2375,6 +2375,33 @@ class VmTool(EnvScript):
         except Exception as ex:
             eprintf("WARNING: alarm delete failed: %s", ex)
 
+    def prune_status_alarms(self):
+        """Delete status-check alarms whose VM no longer exists.  Non-fatal.
+        """
+        if not self.cf.getlist('cloudwatch_alarm_checks', []):
+            return
+        prefix = self.cf.get('cloudwatch_alarm_prefix', 'vm-status-')
+        client = self.get_cloudwatch()
+        try:
+            alive = set()
+            for vm in self.ec2_iter_instances():
+                alive.add(vm['InstanceId'])
+            orphans = []
+            for page in client.get_paginator('describe_alarms').paginate(AlarmNamePrefix=prefix):
+                for alarm in page['MetricAlarms']:
+                    # alarm name is <prefix><check>-<instance-id>
+                    name = alarm['AlarmName']
+                    pos = name.find('-i-')
+                    if pos < 0 or name[pos + 1:] in alive:
+                        continue
+                    orphans.append(name)
+            for pos in range(0, len(orphans), 100):
+                client.delete_alarms(AlarmNames=orphans[pos:pos + 100])
+            if orphans:
+                printf("Pruned %d orphaned status alarms", len(orphans))
+        except Exception as ex:
+            eprintf("WARNING: alarm prune failed: %s", ex)
+
     def cmd_alarm_sync(self, *vm_ids):
         """Create/update status-check alarms for VMs (all running role VMs
         by default).  Does not remove alarms of terminated VMs.
@@ -2587,6 +2614,7 @@ class VmTool(EnvScript):
             printf("Keeping stopped instances")
         else:
             printf("No stopped instances")
+        self.prune_status_alarms()
 
     def cmd_ssh(self, *args):
         """SSH to VM and run command (optional).
