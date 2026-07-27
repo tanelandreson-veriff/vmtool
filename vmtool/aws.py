@@ -358,6 +358,11 @@ class VmTool(EnvScript):
         """
         return self.get_boto3_client('route53')
 
+    def get_cloudwatch(self):
+        """Get cached CloudWatch connection.
+        """
+        return self.get_boto3_client('cloudwatch')
+
     def get_ec2_client(self, region=None):
         return self.get_boto3_client('ec2', region)
 
@@ -2306,9 +2311,117 @@ class VmTool(EnvScript):
 
         return ids
 
+    # CloudWatch status-check alarms, attached to VMs like DNS/EIP.
+    # No-op unless cloudwatch_alarm_checks is set.  AWS evaluates the
+    # metrics and pushes state changes; vmtool only manages the objects.
+    CW_ALARM_SPECS = {
+        'system': ('StatusCheckFailed_System', 1),
+        'instance': ('StatusCheckFailed_Instance', 2),
+        'ebs': ('StatusCheckFailed_AttachedEBS', 1),
+    }
+    CW_ALARM_PAGES = ('system', 'ebs')
+
+    def assign_status_alarms(self, vm_id):
+        """Create status-check alarms for VM.  Idempotent, non-fatal.
+        """
+        checks = self.cf.getlist('cloudwatch_alarm_checks', [])
+        if not checks:
+            return
+        for check in checks:
+            if check not in self.CW_ALARM_SPECS:
+                eprintf("WARNING: cloudwatch_alarm_checks: unknown check, skipping alarms: %s", check)
+                return
+        prefix = self.cf.get('cloudwatch_alarm_prefix', 'vm-status-')
+        topic = self.cf.get('cloudwatch_alarm_topic', '')
+        client = self.get_cloudwatch()
+        for done, check in enumerate(checks):
+            metric, evals = self.CW_ALARM_SPECS[check]
+            desc = self.cf.get('cloudwatch_alarm_desc_%s' % check,
+                               '%s status check failed' % check)
+            actions = [topic] if topic and check in self.CW_ALARM_PAGES else []
+            try:
+                client.put_metric_alarm(
+                    AlarmName='%s%s-%s' % (prefix, check, vm_id),
+                    AlarmDescription='%s - %s' % (self.full_role, desc),
+                    Namespace='AWS/EC2',
+                    MetricName=metric,
+                    Dimensions=[{'Name': 'InstanceId', 'Value': vm_id}],
+                    Statistic='Maximum',
+                    Period=60,
+                    EvaluationPeriods=evals,
+                    Threshold=1,
+                    ComparisonOperator='GreaterThanOrEqualToThreshold',
+                    AlarmActions=actions,
+                    OKActions=actions)
+            except Exception as ex:
+                eprintf("WARNING: alarm create failed (%s/%s), %d/%d alarms set, fix with alarm-sync: %s",
+                        vm_id, check, done, len(checks), ex)
+                return
+        time_printf("Status alarms set: %s", vm_id)
+
+    def drop_status_alarms(self, *vm_ids):
+        """Delete status-check alarms of VMs.  Non-fatal.
+        """
+        if not vm_ids or not self.cf.getlist('cloudwatch_alarm_checks', []):
+            return
+        prefix = self.cf.get('cloudwatch_alarm_prefix', 'vm-status-')
+        names = ['%s%s-%s' % (prefix, check, vm_id)
+                 for vm_id in vm_ids for check in self.CW_ALARM_SPECS]
+        client = self.get_cloudwatch()
+        try:
+            for pos in range(0, len(names), 100):
+                client.delete_alarms(AlarmNames=names[pos:pos + 100])
+            if self.options.verbose:
+                printf("Status alarms dropped: %s", " ".join(vm_ids))
+        except Exception as ex:
+            eprintf("WARNING: alarm delete failed: %s", ex)
+
+    def prune_status_alarms(self):
+        """Delete status-check alarms whose VM no longer exists.  Non-fatal.
+        """
+        if not self.cf.getlist('cloudwatch_alarm_checks', []):
+            return
+        prefix = self.cf.get('cloudwatch_alarm_prefix', 'vm-status-')
+        client = self.get_cloudwatch()
+        try:
+            alive = set()
+            for vm in self.ec2_iter_instances():
+                alive.add(vm['InstanceId'])
+            orphans = []
+            for page in client.get_paginator('describe_alarms').paginate(AlarmNamePrefix=prefix):
+                for alarm in page['MetricAlarms']:
+                    # alarm name is <prefix><check>-<instance-id>
+                    name = alarm['AlarmName']
+                    pos = name.find('-i-')
+                    if pos < 0 or name[pos + 1:] in alive:
+                        continue
+                    orphans.append(name)
+            for pos in range(0, len(orphans), 100):
+                client.delete_alarms(AlarmNames=orphans[pos:pos + 100])
+            if orphans:
+                printf("Pruned %d orphaned status alarms", len(orphans))
+        except Exception as ex:
+            eprintf("WARNING: alarm prune failed: %s", ex)
+
+    def cmd_alarm_sync(self, *vm_ids):
+        """Create/update status-check alarms for VMs (all running role VMs
+        by default).  Does not remove alarms of terminated VMs.
+
+        Group: vm
+        """
+        for check in self.cf.getlist('cloudwatch_alarm_checks', []):
+            if check not in self.CW_ALARM_SPECS:
+                raise UsageError('cloudwatch_alarm_checks: unknown check: %s' % check)
+        if not vm_ids:
+            vm_ids = [vm['InstanceId'] for vm in self.get_running_vms()]
+        for vm_id in vm_ids:
+            self.assign_status_alarms(vm_id)
+
     def vm_create_finish(self, ids):
         for vm_id in ids:
             self.new_ssh_key(vm_id)
+        for vm_id in ids:
+            self.assign_status_alarms(vm_id)
         time_printf("Instances are ready")
         time.sleep(10)
         self._vm_map = {}
@@ -2455,6 +2568,7 @@ class VmTool(EnvScript):
             raise UsageError("Instances not stopped: %s" % " ".join(bad))
         else:
             client.terminate_instances(InstanceIds=ids)
+            self.drop_status_alarms(*ids)
 
     def cmd_gc(self):
         """Terminate all stopped vms.
@@ -2496,10 +2610,12 @@ class VmTool(EnvScript):
         if garbage:
             printf("Terminating: %s", " ".join(garbage))
             client.terminate_instances(InstanceIds=garbage)
+            self.drop_status_alarms(*garbage)
         elif keep_count > 0:
             printf("Keeping stopped instances")
         else:
             printf("No stopped instances")
+        self.prune_status_alarms()
 
     def cmd_ssh(self, *args):
         """SSH to VM and run command (optional).
